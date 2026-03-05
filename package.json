@@ -1,0 +1,51 @@
+{
+  "name": "query-splitter",
+  "displayName": "Query Splitter Chat Participant",
+  "description": "A VS Code Chat Participant that splits multi-topic queries using LLM and processes them one-by-one with user confirmation",
+  "version": "0.0.1",
+  "publisher": "learn-vscode",
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "enabledApiProposals": [],
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "query-splitter.splitter",
+        "name": "splitter",
+        "fullName": "Query Splitter",
+        "description": "Split and process multi-topic queries one by one",
+        "isSticky": true,
+        "commands": [
+          {
+            "name": "split",
+            "description": "Split a multi-topic query and process each part individually with confirmation"
+          }
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "query-splitter.proceed",
+        "title": "Proceed to Next Query"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.96.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.5.0"
+  }
+}
