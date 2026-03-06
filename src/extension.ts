@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
+import * as os from 'os';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -24,6 +26,7 @@ interface SessionState {
         filePath: string;
         originalContent: string;
         proposedContent: string;
+        tempFilePath: string;  // path to the temp file used in diff editor
     };
     /** Current phase in the flow: 'reviewing' = showing changes, 'decided' = accepted/rejected */
     phase: 'processing' | 'reviewing' | 'decided';
@@ -186,7 +189,7 @@ async function processGeneralQuery(
 }
 
 /**
- * Processes a file-based task: finds the file, generates changes, shows diff.
+ * Processes a file-based task: finds the file, generates changes, opens diff editor.
  * Returns true if changes were proposed (awaiting accept/reject), false otherwise.
  */
 async function processFileTask(
@@ -220,32 +223,38 @@ async function processFileTask(
         task.description, fileName, originalContent, model, token
     );
 
-    // Step 4: Show the proposed changes
+    // Step 4: Write proposed content to a temp file and open the diff editor
+    const tempDir = os.tmpdir();
+    const tempFileName = `proposed_${Date.now()}_${fileName}`;
+    const tempFilePath = path.join(tempDir, tempFileName);
+    const tempUri = vscode.Uri.file(tempFilePath);
+
+    // Write proposed content to temp file
+    const encoder = new TextEncoder();
+    await vscode.workspace.fs.writeFile(tempUri, encoder.encode(proposedContent));
+
+    // Open the VS Code diff editor — shows green (added) / red (removed) highlighting
+    await vscode.commands.executeCommand(
+        'vscode.diff',
+        fileUri,                                          // left: original file
+        tempUri,                                          // right: proposed changes
+        `${fileName}: Original ↔ Proposed Changes`,       // diff editor title
+        { preview: true }                                 // open as preview tab
+    );
+
     stream.markdown(`\n### 📝 Proposed Changes for \`${fileName}\`\n\n`);
-    stream.markdown(`Here is the modified file with the requested changes applied:\n\n`);
-
-    // Detect language from file extension for syntax highlighting
-    const ext = fileName.split('.').pop()?.toLowerCase() || '';
-    const langMap: Record<string, string> = {
-        'cs': 'csharp', 'ts': 'typescript', 'js': 'javascript',
-        'py': 'python', 'java': 'java', 'cpp': 'cpp', 'c': 'c',
-        'go': 'go', 'rs': 'rust', 'rb': 'ruby', 'php': 'php',
-        'html': 'html', 'css': 'css', 'json': 'json', 'xml': 'xml',
-        'sql': 'sql', 'sh': 'bash', 'yaml': 'yaml', 'yml': 'yaml',
-        'md': 'markdown'
-    };
-    const lang = langMap[ext] || ext;
-
-    stream.markdown('```' + lang + '\n');
-    stream.markdown(proposedContent);
-    stream.markdown('\n```\n\n');
+    stream.markdown(`📌 **A diff editor has been opened** showing the proposed changes with highlighted lines.\n\n`);
+    stream.markdown(`- 🟢 **Green lines** = additions\n`);
+    stream.markdown(`- 🔴 **Red lines** = removals\n\n`);
+    stream.markdown(`Review the changes in the editor, then click **Accept** or **Reject** below.\n`);
 
     // Store pending change in session for accept/reject
     if (currentSession) {
         currentSession.pendingFileChange = {
             filePath: fileUri.fsPath,
             originalContent: originalContent,
-            proposedContent: proposedContent
+            proposedContent: proposedContent,
+            tempFilePath: tempFilePath
         };
         currentSession.phase = 'reviewing';
     }
@@ -254,12 +263,42 @@ async function processFileTask(
 }
 
 /**
- * Applies the pending file change by writing the proposed content to disk.
+ * Applies the pending file change by writing the proposed content to the original file.
+ * Also closes the diff editor tab and cleans up the temp file.
  */
 async function applyFileChange(change: NonNullable<SessionState['pendingFileChange']>): Promise<void> {
     const uri = vscode.Uri.file(change.filePath);
     const encoder = new TextEncoder();
     await vscode.workspace.fs.writeFile(uri, encoder.encode(change.proposedContent));
+
+    // Close the diff editor tab and clean up temp file
+    await closeDiffAndCleanup(change.tempFilePath);
+}
+
+/**
+ * Closes the diff editor tab (if open) and deletes the temp file.
+ */
+async function closeDiffAndCleanup(tempFilePath: string): Promise<void> {
+    // Close any tab whose URI matches the temp file
+    const tempUri = vscode.Uri.file(tempFilePath);
+    for (const tabGroup of vscode.window.tabGroups.all) {
+        for (const tab of tabGroup.tabs) {
+            // Diff tabs have input type TabInputTextDiff
+            const input = tab.input;
+            if (input instanceof vscode.TabInputTextDiff) {
+                if (input.modified.fsPath === tempUri.fsPath || input.original.fsPath === tempUri.fsPath) {
+                    await vscode.window.tabGroups.close(tab);
+                }
+            }
+        }
+    }
+
+    // Delete the temp file
+    try {
+        await vscode.workspace.fs.delete(tempUri);
+    } catch {
+        // Ignore if already deleted
+    }
 }
 
 
@@ -324,6 +363,9 @@ export function activate(context: vscode.ExtensionContext) {
 
         // ── Handle REJECT changes ────────────────────────────────────
         if (isReject && currentSession?.pendingFileChange) {
+            // Close the diff editor and clean up temp file
+            await closeDiffAndCleanup(currentSession.pendingFileChange.tempFilePath);
+
             stream.markdown(`❌ **Changes rejected** for \`${currentSession.pendingFileChange.filePath}\`. File was not modified.\n\n`);
             currentSession.pendingFileChange = undefined;
             currentSession.phase = 'decided';
