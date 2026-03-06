@@ -2,92 +2,175 @@ import * as vscode from 'vscode';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
+/**
+ * Represents a single task identified by the LLM splitter.
+ * Can be a general knowledge query OR a file-based task.
+ */
+interface SplitTask {
+    description: string;   // The full task description (e.g., "Add proper comments in student.cs")
+    fileName?: string;     // If file-based, the filename to find (e.g., "student.cs")
+    isFileTask: boolean;   // Whether this task involves modifying a file
+}
+
+/**
+ * Tracks the current state of the multi-task session.
+ */
 interface SessionState {
-    queries: string[];
+    tasks: SplitTask[];
     currentIndex: number;
     originalPrompt: string;
+    /** For file tasks: stores proposed new content awaiting accept/reject */
+    pendingFileChange?: {
+        filePath: string;
+        originalContent: string;
+        proposedContent: string;
+    };
+    /** Current phase in the flow: 'reviewing' = showing changes, 'decided' = accepted/rejected */
+    phase: 'processing' | 'reviewing' | 'decided';
 }
 
 interface ISplitterChatResult extends vscode.ChatResult {
     metadata: {
         command: string;
         sessionActive: boolean;
-        remainingQueries: number;
+        remainingTasks: number;
+        awaitingDecision: boolean;  // true when waiting for accept/reject
     };
 }
 
 // ─── Session Store ───────────────────────────────────────────────────────────
 
-// We use a single session per extension instance since chat participants
-// operate in a single-threaded conversation context.
 let currentSession: SessionState | null = null;
 
 // ─── LLM Helpers ─────────────────────────────────────────────────────────────
 
 /**
- * Uses the LLM to split a multi-topic user query into individual sub-queries.
- * Returns a JSON array of strings, each being a self-contained question.
+ * Uses the LLM to split a user query into individual tasks.
+ * Detects whether each task involves a file (returns structured JSON).
  */
 async function splitQueryWithLLM(
     prompt: string,
     model: vscode.LanguageModelChat,
     token: vscode.CancellationToken
-): Promise<string[]> {
-    const systemPrompt = `You are a query splitter. Your job is to analyze the user's message and split it into individual, independent sub-queries.
+): Promise<SplitTask[]> {
+    const systemPrompt = `You are a task splitter. Analyze the user's message and split it into individual, independent tasks.
 
 Rules:
-1. Each sub-query must be a complete, self-contained question or request.
-2. Preserve the user's original intent and detail level for each sub-query.
-3. If the query is about multiple topics/subjects (e.g., "Java and C#"), create separate queries for each.
-4. If the query cannot be meaningfully split (it's about a single topic), return it as a single-element array.
-5. Return ONLY a valid JSON array of strings, nothing else. No markdown, no explanation.
+1. Each task must be self-contained with the full intent preserved.
+2. If the query mentions multiple files (e.g., "student.cs and teachers.cs"), create a separate task for EACH file.
+3. If the query mentions multiple topics/subjects (e.g., "Java and C#"), create separate tasks for each.
+4. Detect if a task involves modifying a file — look for filenames with extensions like .cs, .ts, .js, .py, .java, etc.
+5. Return ONLY a valid JSON array. No markdown, no explanation.
+
+JSON format for each task:
+{
+  "description": "the full task description",
+  "fileName": "filename.ext or null if not a file task",
+  "isFileTask": true/false
+}
 
 Examples:
+- Input: "Add proper comments in below files - student.cs and teachers.cs"
+  Output: [{"description":"Add proper comments in student.cs","fileName":"student.cs","isFileTask":true},{"description":"Add proper comments in teachers.cs","fileName":"teachers.cs","isFileTask":true}]
+
 - Input: "Give me top 3 Features of Java and C#"
-  Output: ["Give me top 3 Features of Java", "Give me top 3 Features of C#"]
+  Output: [{"description":"Give me top 3 Features of Java","fileName":null,"isFileTask":false},{"description":"Give me top 3 Features of C#","fileName":null,"isFileTask":false}]
 
-- Input: "Explain the difference between REST and GraphQL and also compare SQL vs NoSQL"
-  Output: ["Explain the difference between REST and GraphQL", "Compare SQL vs NoSQL"]
-
-- Input: "What is Python?"
-  Output: ["What is Python?"]`;
+- Input: "Refactor the login method in auth.ts"
+  Output: [{"description":"Refactor the login method in auth.ts","fileName":"auth.ts","isFileTask":true}]`;
 
     const messages = [
         vscode.LanguageModelChatMessage.User(systemPrompt),
-        vscode.LanguageModelChatMessage.User(`Split this query: "${prompt}"`)
+        vscode.LanguageModelChatMessage.User(`Split this: "${prompt}"`)
     ];
 
     const response = await model.sendRequest(messages, {}, token);
 
-    // Collect the full response text
     let fullResponse = '';
     for await (const fragment of response.text) {
         fullResponse += fragment;
     }
 
-    // Parse the JSON array from the response
     try {
-        // Try to extract JSON array from the response (LLM might wrap it in markdown)
         const jsonMatch = fullResponse.match(/\[[\s\S]*\]/);
         if (jsonMatch) {
             const parsed = JSON.parse(jsonMatch[0]);
             if (Array.isArray(parsed) && parsed.length > 0) {
-                return parsed.map((q: unknown) => String(q).trim());
+                return parsed.map((t: any) => ({
+                    description: String(t.description || '').trim(),
+                    fileName: t.fileName && t.fileName !== 'null' ? String(t.fileName).trim() : undefined,
+                    isFileTask: Boolean(t.isFileTask)
+                }));
             }
         }
     } catch (e) {
-        // If parsing fails, treat the original prompt as a single query
         console.error('Failed to parse LLM split response:', e);
     }
 
-    // Fallback: return original prompt as single query
-    return [prompt];
+    // Fallback: single non-file task
+    return [{ description: prompt, isFileTask: false }];
 }
 
 /**
- * Sends a single sub-query to the LLM and streams the response to the chat.
+ * Searches the workspace for a file by name.
+ * Returns the URI of the first match, or undefined.
  */
-async function processSubQuery(
+async function findFileInWorkspace(fileName: string): Promise<vscode.Uri | undefined> {
+    const files = await vscode.workspace.findFiles(`**/${fileName}`, '**/node_modules/**', 5);
+    return files.length > 0 ? files[0] : undefined;
+}
+
+/**
+ * Reads the full content of a file.
+ */
+async function readFileContent(uri: vscode.Uri): Promise<string> {
+    const bytes = await vscode.workspace.fs.readFile(uri);
+    return Buffer.from(bytes).toString('utf-8');
+}
+
+/**
+ * Uses the LLM to generate the modified file content for a file task.
+ * Returns the full proposed new content of the file.
+ */
+async function generateFileChanges(
+    taskDescription: string,
+    fileName: string,
+    fileContent: string,
+    model: vscode.LanguageModelChat,
+    token: vscode.CancellationToken
+): Promise<string> {
+    const systemPrompt = `You are a code assistant. The user wants you to modify a file.
+Your task: ${taskDescription}
+
+RULES:
+1. Return the COMPLETE modified file content — every line, not just the changed parts.
+2. Do NOT wrap the output in markdown code fences or add any commentary.
+3. Only return the raw file content, ready to be saved directly.
+4. Preserve the original file structure, indentation, and formatting.
+5. Apply the requested changes carefully and thoroughly.`;
+
+    const messages = [
+        vscode.LanguageModelChatMessage.User(systemPrompt),
+        vscode.LanguageModelChatMessage.User(`Here is the current content of "${fileName}":\n\n${fileContent}`)
+    ];
+
+    const response = await model.sendRequest(messages, {}, token);
+
+    let result = '';
+    for await (const fragment of response.text) {
+        result += fragment;
+    }
+
+    // Strip markdown code fences if the LLM added them despite instructions
+    result = result.replace(/^```[\w]*\n?/, '').replace(/\n?```\s*$/, '');
+
+    return result;
+}
+
+/**
+ * Sends a general (non-file) query to the LLM and streams the response.
+ */
+async function processGeneralQuery(
     query: string,
     model: vscode.LanguageModelChat,
     stream: vscode.ChatResponseStream,
@@ -96,13 +179,89 @@ async function processSubQuery(
     const messages = [
         vscode.LanguageModelChatMessage.User(query)
     ];
-
     const response = await model.sendRequest(messages, {}, token);
-
     for await (const fragment of response.text) {
         stream.markdown(fragment);
     }
 }
+
+/**
+ * Processes a file-based task: finds the file, generates changes, shows diff.
+ * Returns true if changes were proposed (awaiting accept/reject), false otherwise.
+ */
+async function processFileTask(
+    task: SplitTask,
+    model: vscode.LanguageModelChat,
+    stream: vscode.ChatResponseStream,
+    token: vscode.CancellationToken
+): Promise<boolean> {
+    const fileName = task.fileName!;
+
+    // Step 1: Find the file in workspace
+    stream.progress(`🔍 Searching for "${fileName}" in workspace...`);
+    const fileUri = await findFileInWorkspace(fileName);
+
+    if (!fileUri) {
+        stream.markdown(`\n⚠️ **File not found:** Could not find \`${fileName}\` in the workspace.\n\n`);
+        stream.markdown(`Please make sure the file exists in your open workspace folders.\n`);
+        return false;
+    }
+
+    stream.markdown(`📁 **Found:** \`${fileUri.fsPath}\`\n\n`);
+    stream.reference(fileUri);
+
+    // Step 2: Read current content
+    stream.progress('📖 Reading file content...');
+    const originalContent = await readFileContent(fileUri);
+
+    // Step 3: Generate changes via LLM
+    stream.progress(`🤖 Generating changes for "${fileName}"...`);
+    const proposedContent = await generateFileChanges(
+        task.description, fileName, originalContent, model, token
+    );
+
+    // Step 4: Show the proposed changes
+    stream.markdown(`\n### 📝 Proposed Changes for \`${fileName}\`\n\n`);
+    stream.markdown(`Here is the modified file with the requested changes applied:\n\n`);
+
+    // Detect language from file extension for syntax highlighting
+    const ext = fileName.split('.').pop()?.toLowerCase() || '';
+    const langMap: Record<string, string> = {
+        'cs': 'csharp', 'ts': 'typescript', 'js': 'javascript',
+        'py': 'python', 'java': 'java', 'cpp': 'cpp', 'c': 'c',
+        'go': 'go', 'rs': 'rust', 'rb': 'ruby', 'php': 'php',
+        'html': 'html', 'css': 'css', 'json': 'json', 'xml': 'xml',
+        'sql': 'sql', 'sh': 'bash', 'yaml': 'yaml', 'yml': 'yaml',
+        'md': 'markdown'
+    };
+    const lang = langMap[ext] || ext;
+
+    stream.markdown('```' + lang + '\n');
+    stream.markdown(proposedContent);
+    stream.markdown('\n```\n\n');
+
+    // Store pending change in session for accept/reject
+    if (currentSession) {
+        currentSession.pendingFileChange = {
+            filePath: fileUri.fsPath,
+            originalContent: originalContent,
+            proposedContent: proposedContent
+        };
+        currentSession.phase = 'reviewing';
+    }
+
+    return true;
+}
+
+/**
+ * Applies the pending file change by writing the proposed content to disk.
+ */
+async function applyFileChange(change: NonNullable<SessionState['pendingFileChange']>): Promise<void> {
+    const uri = vscode.Uri.file(change.filePath);
+    const encoder = new TextEncoder();
+    await vscode.workspace.fs.writeFile(uri, encoder.encode(change.proposedContent));
+}
+
 
 // ─── Extension Activation ────────────────────────────────────────────────────
 
@@ -112,161 +271,226 @@ export function activate(context: vscode.ExtensionContext) {
 
     const handler: vscode.ChatRequestHandler = async (
         request: vscode.ChatRequest,
-        chatContext: vscode.ChatContext,
+        _chatContext: vscode.ChatContext,
         stream: vscode.ChatResponseStream,
         token: vscode.CancellationToken
     ): Promise<ISplitterChatResult> => {
 
-        // Check if this is a "proceed" follow-up from an active session
-        const isContinuation = request.prompt.startsWith('__SPLITTER_PROCEED__');
-        const isSkip = request.prompt.startsWith('__SPLITTER_SKIP__');
-        const isStop = request.prompt.startsWith('__SPLITTER_STOP__');
+        const prompt = request.prompt;
 
-        // ── Handle Stop ──────────────────────────────────────────────
+        // ─── Follow-up Actions ───────────────────────────────────────
+        const isAccept = prompt.startsWith('__SPLITTER_ACCEPT__');
+        const isReject = prompt.startsWith('__SPLITTER_REJECT__');
+        const isProceed = prompt.startsWith('__SPLITTER_PROCEED__');
+        const isSkip = prompt.startsWith('__SPLITTER_SKIP__');
+        const isStop = prompt.startsWith('__SPLITTER_STOP__');
+
+        // ── Handle STOP ──────────────────────────────────────────────
         if (isStop && currentSession) {
+            const done = currentSession.currentIndex;
+            const total = currentSession.tasks.length;
             stream.markdown('---\n\n');
             stream.markdown('🛑 **Processing stopped by user.**\n\n');
-            stream.markdown(`Completed **${currentSession.currentIndex}** of **${currentSession.queries.length}** queries.\n`);
+            stream.markdown(`Completed **${done}** of **${total}** tasks.\n`);
             currentSession = null;
-            return {
-                metadata: { command: 'stop', sessionActive: false, remainingQueries: 0 }
-            };
+            return { metadata: { command: 'stop', sessionActive: false, remainingTasks: 0, awaitingDecision: false } };
         }
 
-        // ── Handle Continue / Skip ───────────────────────────────────
-        if ((isContinuation || isSkip) && currentSession) {
+        // ── Handle ACCEPT changes ────────────────────────────────────
+        if (isAccept && currentSession?.pendingFileChange) {
+            try {
+                await applyFileChange(currentSession.pendingFileChange);
+                stream.markdown(`✅ **Changes accepted and applied** to \`${currentSession.pendingFileChange.filePath}\`\n\n`);
+            } catch (err) {
+                stream.markdown(`⚠️ **Failed to apply changes:** ${err}\n\n`);
+            }
+            currentSession.pendingFileChange = undefined;
+            currentSession.phase = 'decided';
+            currentSession.currentIndex++;
+
+            const remaining = currentSession.tasks.length - currentSession.currentIndex;
+            if (remaining > 0) {
+                stream.markdown('---\n\n');
+                stream.markdown(`📋 **${remaining}** task(s) remaining.\n\n`);
+                stream.markdown(`**Next:** "${currentSession.tasks[currentSession.currentIndex].description}"\n`);
+                return { metadata: { command: 'accepted', sessionActive: true, remainingTasks: remaining, awaitingDecision: false } };
+            } else {
+                stream.markdown('---\n\n');
+                stream.markdown('🎉 **All tasks completed!**\n');
+                currentSession = null;
+                return { metadata: { command: 'complete', sessionActive: false, remainingTasks: 0, awaitingDecision: false } };
+            }
+        }
+
+        // ── Handle REJECT changes ────────────────────────────────────
+        if (isReject && currentSession?.pendingFileChange) {
+            stream.markdown(`❌ **Changes rejected** for \`${currentSession.pendingFileChange.filePath}\`. File was not modified.\n\n`);
+            currentSession.pendingFileChange = undefined;
+            currentSession.phase = 'decided';
+            currentSession.currentIndex++;
+
+            const remaining = currentSession.tasks.length - currentSession.currentIndex;
+            if (remaining > 0) {
+                stream.markdown('---\n\n');
+                stream.markdown(`📋 **${remaining}** task(s) remaining.\n\n`);
+                stream.markdown(`**Next:** "${currentSession.tasks[currentSession.currentIndex].description}"\n`);
+                return { metadata: { command: 'rejected', sessionActive: true, remainingTasks: remaining, awaitingDecision: false } };
+            } else {
+                stream.markdown('---\n\n');
+                stream.markdown('🎉 **All tasks completed!**\n');
+                currentSession = null;
+                return { metadata: { command: 'complete', sessionActive: false, remainingTasks: 0, awaitingDecision: false } };
+            }
+        }
+
+        // ── Handle PROCEED to next task ──────────────────────────────
+        if ((isProceed || isSkip) && currentSession) {
             if (isSkip) {
-                stream.markdown(`⏭️ **Skipped:** "${currentSession.queries[currentSession.currentIndex]}"\n\n`);
+                stream.markdown(`⏭️ **Skipped:** "${currentSession.tasks[currentSession.currentIndex].description}"\n\n`);
                 currentSession.currentIndex++;
             }
 
-            // Process the current sub-query
-            if (currentSession.currentIndex < currentSession.queries.length) {
-                const queryIndex = currentSession.currentIndex;
-                const query = currentSession.queries[queryIndex];
-                const total = currentSession.queries.length;
+            if (currentSession.currentIndex < currentSession.tasks.length) {
+                return await processCurrentTask(request, stream, token);
+            } else {
+                stream.markdown('🎉 **All tasks completed!**\n');
+                currentSession = null;
+                return { metadata: { command: 'complete', sessionActive: false, remainingTasks: 0, awaitingDecision: false } };
+            }
+        }
 
+        // ─── New Query (First Invocation) ────────────────────────────
+
+        if (!prompt.trim()) {
+            stream.markdown('Please provide a query. For example:\n\n');
+            stream.markdown('> `@splitter Give me top 3 Features of Java and C#`\n\n');
+            stream.markdown('> `@splitter Add proper comments in student.cs and teachers.cs`\n');
+            return { metadata: { command: 'empty', sessionActive: false, remainingTasks: 0, awaitingDecision: false } };
+        }
+
+        // Step 1: Split the query using LLM
+        stream.progress('🔍 Analyzing your query to identify tasks...');
+
+        let tasks: SplitTask[];
+        try {
+            tasks = await splitQueryWithLLM(prompt, request.model, token);
+        } catch (err) {
+            stream.markdown(`⚠️ Failed to split query: ${err}\n\nProcessing as a single task.\n\n`);
+            tasks = [{ description: prompt, isFileTask: false }];
+        }
+
+        // Step 2: Show the split results
+        if (tasks.length === 1 && !tasks[0].isFileTask) {
+            // Single general query — process directly
+            stream.markdown(`## 📝 Processing Your Query\n\n`);
+            try {
+                await processGeneralQuery(tasks[0].description, request.model, stream, token);
+            } catch (err) {
+                stream.markdown(`\n\n⚠️ *Error: ${err}*\n`);
+            }
+            return { metadata: { command: 'single', sessionActive: false, remainingTasks: 0, awaitingDecision: false } };
+        }
+
+        // Multiple tasks — show summary and start interactive session
+        stream.markdown(`## 🔀 Task Split Results\n\n`);
+        stream.markdown(`I identified **${tasks.length} task(s)** from your message:\n\n`);
+        tasks.forEach((t, i) => {
+            const icon = t.isFileTask ? '📄' : '💬';
+            stream.markdown(`${i + 1}. ${icon} ${t.description}${t.fileName ? ` (\`${t.fileName}\`)` : ''}\n`);
+        });
+        stream.markdown('\n---\n\n');
+
+        // Initialize session
+        currentSession = {
+            tasks: tasks,
+            currentIndex: 0,
+            originalPrompt: prompt,
+            phase: 'processing'
+        };
+
+        // Process the first task
+        return await processCurrentTask(request, stream, token);
+    };
+
+    /**
+     * Processes the task at currentSession.currentIndex.
+     * Handles both file-based and general query tasks.
+     */
+    async function processCurrentTask(
+        request: vscode.ChatRequest,
+        stream: vscode.ChatResponseStream,
+        token: vscode.CancellationToken
+    ): Promise<ISplitterChatResult> {
+
+        if (!currentSession) {
+            return { metadata: { command: 'error', sessionActive: false, remainingTasks: 0, awaitingDecision: false } };
+        }
+
+        const idx = currentSession.currentIndex;
+        const task = currentSession.tasks[idx];
+        const total = currentSession.tasks.length;
+
+        stream.progress(`Processing task ${idx + 1} of ${total}...`);
+        stream.markdown(`## 📝 Task ${idx + 1} of ${total}\n`);
+        stream.markdown(`**${task.description}**\n\n`);
+
+        if (task.isFileTask && task.fileName) {
+            // ── File Task ────────────────────────────────────────────
+            const hasChanges = await processFileTask(task, request.model, stream, token);
+
+            if (hasChanges) {
+                // Waiting for accept/reject
                 stream.markdown('---\n\n');
-                stream.progress(`Processing query ${queryIndex + 1} of ${total}...`);
-                stream.markdown(`## 📝 Query ${queryIndex + 1} of ${total}\n`);
-                stream.markdown(`**"${query}"**\n\n`);
+                stream.markdown('👆 **Review the proposed changes above.** Do you want to apply them?\n');
 
-                try {
-                    await processSubQuery(query, request.model, stream, token);
-                } catch (err) {
-                    stream.markdown(`\n\n⚠️ *Error processing this query: ${err}*\n`);
-                }
-
+                return {
+                    metadata: {
+                        command: 'file-review',
+                        sessionActive: true,
+                        remainingTasks: total - idx - 1,
+                        awaitingDecision: true
+                    }
+                };
+            } else {
+                // File not found or error — move on
                 currentSession.currentIndex++;
                 const remaining = total - currentSession.currentIndex;
 
                 if (remaining > 0) {
-                    stream.markdown('\n\n---\n\n');
-                    stream.markdown(`✅ **Query ${queryIndex + 1} complete!** ${remaining} more query(ies) remaining.\n\n`);
-                    stream.markdown(`**Next up:** "${currentSession.queries[currentSession.currentIndex]}"\n`);
-
-                    return {
-                        metadata: {
-                            command: 'proceed',
-                            sessionActive: true,
-                            remainingQueries: remaining
-                        }
-                    };
+                    stream.markdown('---\n\n');
+                    stream.markdown(`📋 **${remaining}** task(s) remaining.\n\n`);
+                    stream.markdown(`**Next:** "${currentSession.tasks[currentSession.currentIndex].description}"\n`);
+                    return { metadata: { command: 'file-not-found', sessionActive: true, remainingTasks: remaining, awaitingDecision: false } };
                 } else {
-                    stream.markdown('\n\n---\n\n');
-                    stream.markdown('🎉 **All queries processed!**\n');
+                    stream.markdown('🎉 **All tasks completed!**\n');
                     currentSession = null;
-
-                    return {
-                        metadata: { command: 'complete', sessionActive: false, remainingQueries: 0 }
-                    };
+                    return { metadata: { command: 'complete', sessionActive: false, remainingTasks: 0, awaitingDecision: false } };
                 }
             }
-        }
-
-        // ── Handle New Query (first invocation) ──────────────────────
-
-        const userPrompt = request.prompt;
-
-        if (!userPrompt.trim()) {
-            stream.markdown('Please provide a query to split. For example:\n\n');
-            stream.markdown('> `@splitter Give me top 3 Features of Java and C#`\n');
-            return {
-                metadata: { command: 'empty', sessionActive: false, remainingQueries: 0 }
-            };
-        }
-
-        // Step 1: Split the query using LLM
-        stream.progress('🔍 Analyzing your query to identify sub-topics...');
-
-        let queries: string[];
-        try {
-            queries = await splitQueryWithLLM(userPrompt, request.model, token);
-        } catch (err) {
-            stream.markdown(`⚠️ Failed to split query: ${err}\n\nProcessing as a single query instead.\n\n`);
-            queries = [userPrompt];
-        }
-
-        // Step 2: Show the split results
-        if (queries.length === 1) {
-            // Single query — process directly without the loop
-            stream.markdown(`## 📝 Processing Your Query\n\n`);
-            stream.markdown(`Your query is about a single topic. Processing directly...\n\n`);
-            stream.markdown('---\n\n');
-
+        } else {
+            // ── General Query Task ───────────────────────────────────
             try {
-                await processSubQuery(queries[0], request.model, stream, token);
+                await processGeneralQuery(task.description, request.model, stream, token);
             } catch (err) {
-                stream.markdown(`\n\n⚠️ *Error processing query: ${err}*\n`);
+                stream.markdown(`\n\n⚠️ *Error: ${err}*\n`);
             }
 
-            return {
-                metadata: { command: 'single', sessionActive: false, remainingQueries: 0 }
-            };
-        }
+            currentSession.currentIndex++;
+            const remaining = total - currentSession.currentIndex;
 
-        // Multiple queries — start the interactive session
-        stream.markdown(`## 🔀 Query Split Results\n\n`);
-        stream.markdown(`I identified **${queries.length} sub-queries** from your message:\n\n`);
-        queries.forEach((q, i) => {
-            stream.markdown(`${i + 1}. "${q}"\n`);
-        });
-        stream.markdown('\n---\n\n');
-
-        // Initialize session state
-        currentSession = {
-            queries: queries,
-            currentIndex: 0,
-            originalPrompt: userPrompt
-        };
-
-        // Process the first query immediately
-        const firstQuery = queries[0];
-        stream.progress('Processing query 1...');
-        stream.markdown(`## 📝 Query 1 of ${queries.length}\n`);
-        stream.markdown(`**"${firstQuery}"**\n\n`);
-
-        try {
-            await processSubQuery(firstQuery, request.model, stream, token);
-        } catch (err) {
-            stream.markdown(`\n\n⚠️ *Error processing this query: ${err}*\n`);
-        }
-
-        currentSession.currentIndex = 1;
-        const remaining = queries.length - 1;
-
-        stream.markdown('\n\n---\n\n');
-        stream.markdown(`✅ **Query 1 complete!** ${remaining} more query(ies) remaining.\n\n`);
-        stream.markdown(`**Next up:** "${queries[1]}"\n`);
-
-        return {
-            metadata: {
-                command: 'split',
-                sessionActive: true,
-                remainingQueries: remaining
+            if (remaining > 0) {
+                stream.markdown('\n\n---\n\n');
+                stream.markdown(`✅ **Task ${idx + 1} complete!** ${remaining} task(s) remaining.\n\n`);
+                stream.markdown(`**Next:** "${currentSession.tasks[currentSession.currentIndex].description}"\n`);
+                return { metadata: { command: 'query-done', sessionActive: true, remainingTasks: remaining, awaitingDecision: false } };
+            } else {
+                stream.markdown('\n\n---\n\n');
+                stream.markdown('🎉 **All tasks completed!**\n');
+                currentSession = null;
+                return { metadata: { command: 'complete', sessionActive: false, remainingTasks: 0, awaitingDecision: false } };
             }
-        };
-    };
+        }
+    }
 
     // ── Create Chat Participant ──────────────────────────────────────────
 
@@ -281,25 +505,44 @@ export function activate(context: vscode.ExtensionContext) {
             _context: vscode.ChatContext,
             _token: vscode.CancellationToken
         ): vscode.ChatFollowup[] {
-            if (result.metadata.sessionActive && result.metadata.remainingQueries > 0) {
+
+            // Case 1: Awaiting accept/reject decision on file changes
+            if (result.metadata.awaitingDecision) {
                 return [
                     {
-                        prompt: '__SPLITTER_PROCEED__',
-                        label: `✅ Yes, Proceed to next query (${result.metadata.remainingQueries} remaining)`,
+                        prompt: '__SPLITTER_ACCEPT__',
+                        label: '✅ Accept Changes',
                         command: 'split'
                     },
                     {
-                        prompt: '__SPLITTER_SKIP__',
-                        label: '⏭️ Skip this & proceed to next',
-                        command: 'split'
-                    },
-                    {
-                        prompt: '__SPLITTER_STOP__',
-                        label: '❌ Stop here',
+                        prompt: '__SPLITTER_REJECT__',
+                        label: '❌ Reject Changes',
                         command: 'split'
                     }
                 ];
             }
+
+            // Case 2: Task done, more tasks remain — ask "Should I proceed?"
+            if (result.metadata.sessionActive && result.metadata.remainingTasks > 0) {
+                return [
+                    {
+                        prompt: '__SPLITTER_PROCEED__',
+                        label: `▶️ Yes, Proceed to next task (${result.metadata.remainingTasks} remaining)`,
+                        command: 'split'
+                    },
+                    {
+                        prompt: '__SPLITTER_SKIP__',
+                        label: '⏭️ Skip next & proceed',
+                        command: 'split'
+                    },
+                    {
+                        prompt: '__SPLITTER_STOP__',
+                        label: '⏹️ Stop here',
+                        command: 'split'
+                    }
+                ];
+            }
+
             return [];
         }
     };
@@ -310,6 +553,5 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
-    // Clean up session state
     currentSession = null;
 }
